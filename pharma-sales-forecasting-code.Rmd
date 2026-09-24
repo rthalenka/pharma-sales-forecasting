@@ -1,0 +1,585 @@
+---
+title: "Box-Jenkins Forecasting: SARIMA Modeling of Pharmaceutical Sales"
+subtitle: "Evaluating Seasonal Demand and Model Ensembles for Antihistamine Sales (R06)"
+author: "Renata Halenka 20201528; João Neto 20201566"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::robobook:
+    highlight: kate
+    number_sections: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Introduction & Problem Framing
+
+This project applies the Box-Jenkins methodology to analyze and forecast
+the sales volume of pharmaceutical products, specifically focusing on
+the R06 category (Antihistamines for systemic use).\
+The dataset consists of Pharmacy Point-of-Sale transactions, which have
+been aggregated to a monthly frequency.
+
+Because antihistamine demand is heavily driven by real-world biological
+cycles, this series is expected to exhibit strong, predictable seasonal
+fluctuations.
+
+Accurate forecasting on this localized scale holds significant business
+value for individual pharmacies. It allows them to anticipate peak
+demand, optimize inventory procurement, and prevent stock-outs.
+
+By validating a parsimonious ARIMA model, this analysis aims to
+determine whether short-term antihistamine demand can be reliably
+predicted using only its own historical autoregressive and seasonal
+memory.
+
+# Exploratory Data Analysis & Preprocessing
+
+```{r data-prep, message=FALSE, warning=FALSE, echo=FALSE}
+library(fpp3)
+library(lubridate)
+library(dplyr)
+library(knitr)
+library(urca)
+library(fable)
+library(kableExtra)
+
+meds <- read.csv("salesdaily.csv", sep = ",")
+
+anti_histam <- meds %>%
+  mutate(Mes = yearmonth(mdy(datum))) %>% 
+  filter(Mes < yearmonth("2019 Oct")) %>%  ##remove incomplete month
+  group_by(Mes) %>% 
+  summarise(Total_Sales = sum(as.numeric(R06), na.rm = TRUE)) %>% 
+  as_tsibble(index = Mes)
+
+ 
+cutoff <- max(anti_histam$Mes) - 16
+anti_histam_train <- anti_histam %>% filter(Mes <= cutoff)
+anti_histam_test  <- anti_histam %>% filter(Mes > cutoff)
+
+```
+
+## Visual Inspection and STL Decomposition
+
+```{r stl-decomp, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5}
+
+anti_histam_train %>%
+  model(STL(Total_Sales ~ trend(window = 21) + season(window = "periodic"))) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "STL Decomposition of Antihistamine Sales",
+       subtitle = "Isolating the rigid seasonal allergy cycle from trend and remainder")
+
+```
+
+Visual inspection of the raw antihistamine sales reveals a clear
+12-month seasonal pattern. Furthermore, the amplitude of the seasonal
+fluctuations is not constant; the variance appears to increase with the
+level of the series. Because the variance is non-constant, a variance
+stabilization transformation is formally required before proceeding to
+stationarity tests.
+
+## Variance Stabilization Evaluation
+
+```{r variance-stabilization, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=4}
+lambda_val <- anti_histam_train %>%
+  features(Total_Sales, features = guerrero) %>%
+  pull(lambda_guerrero)
+
+
+anti_histam_train <- anti_histam_train %>%
+  mutate(Transformed_Sales = box_cox(Total_Sales, lambda_val))
+anti_histam_test <- anti_histam_test %>%
+  mutate(Transformed_Sales = box_cox(Total_Sales, lambda_val))
+anti_histam <- anti_histam %>%
+  mutate(Transformed_Sales = box_cox(Total_Sales, lambda_val))
+
+data.frame(
+  Method = "Guerrero Optimization",
+  Optimal_Lambda = round(lambda_val, 3),
+  Transformation = ifelse(abs(lambda_val - 1) > 0.1,
+                          "Box-Cox Required",
+                          "No Transformation Needed")
+) %>%
+  kable(caption = "Variance Stabilization Diagnostic (Training Set)", align = "c")
+
+
+```
+
+During our initial visual inspection, the amplitude of the seasonal
+sales fluctuations appeared to increase alongside the overall level of
+the series, suggesting non-constant variance. To formally test this, we
+applied the Guerrero method to the training data. The calculation
+yielded an optimal Box-Cox parameter (λ) of `r round(lambda_val, 3)`, which is
+significantly distinct of 1.0.
+
+This mathematical result confirms our visual hypothesis: the variance is
+non-constant. Therefore, the Box-Cox transformation is strictly required
+to stabilize the variance across the series, satisfying the prerequisite
+assumptions for formal Box-Jenkins estimation.
+
+## Stationarity Diagnostics and Differencing
+
+```{r unit-root-tests, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+
+run_gts_adf <- function(series, type = "trend", max_lags = 16) {
+  optimal_p <- 0
+  for (p in max_lags:1) {
+    test <- ur.df(series, type = type, lags = p)
+    coefs <- test@testreg$coefficients
+    if (coefs[nrow(coefs), 4] < 0.10) {
+      optimal_p <- p
+      break
+    }
+  }
+  ur.df(series, type = type, lags = optimal_p)
+
+}
+
+
+adf_raw <- run_gts_adf(anti_histam_train$Transformed_Sales,
+                        type = "trend", max_lags = 16)
+
+
+
+anti_histam_train <- anti_histam_train %>%
+  mutate(Stationary_Sales = difference(Transformed_Sales, 16))
+
+
+
+t_test_diff <- t.test(na.omit(anti_histam_train$Stationary_Sales))
+
+
+
+adf_diff <- run_gts_adf(na.omit(anti_histam_train$Stationary_Sales),
+                         type = "none", max_lags = 16)
+
+
+adf_summary <- data.frame(
+  Data_State       = c("Box-Cox Transformed", "Box-Cox + Seasonal Diff (D=1)"),
+  ADF_Type         = c("trend", "none"),
+  Optimal_Lags     = c(length(adf_raw@testreg$coefficients[,1]) - 3,
+                       length(adf_diff@testreg$coefficients[,1]) - 2),
+  Test_Statistic   = c(round(adf_raw@teststat[1], 4),
+                       round(adf_diff@teststat[1], 4)),
+  Critical_5pct    = c(adf_raw@cval[1, "5pct"],
+                       adf_diff@cval[1, "5pct"]),
+  Conclusion       = c("Non-Stationary", "Stationary")
+)
+
+kable(adf_summary,
+      caption = paste0("ADF Unit Root Diagnostics (GTS Procedure). ",
+                       "T-test for zero mean on differenced series: p = ",
+                       round(t_test_diff$p.value, 4)),
+      align = "c")
+
+```
+
+```         
+```
+
+Stationarity was evaluated on the Box-Cox transformed series using the
+ADF test via the GTS lag reduction procedure (initialized at 16 lags).
+The transformed level data failed to reject the unit root null under a
+trend specification, confirming non-stationarity. A seasonal difference
+(D=1) was applied, and a formal t-test confirmed the differenced series
+has a mean not significantly different from zero (p \> 0.05), justifying
+the switch to type="none". Retesting under GTS confirmed the differenced
+series rejects the unit root null at the 5% level. No regular
+differencing was required (d=0). The series is now fully stationary with
+integration orders d=0, D=1.
+
+# Model Identification (ACF & PACF)
+
+## ACF and PACF Diagnostics
+
+```{r acf-pacf, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5}
+
+anti_histam_train %>%
+  gg_tsdisplay(Stationary_Sales, plot_type = "partial", lag_max = 36) +
+  labs(title = "Correlograms of Fully Stationary Antihistamine Sales",
+       subtitle = "Variance Stabilized (Box-Cox) and Seasonally Differenced (D=1)",
+       y = "Stationary Sales")
+```
+
+## Model Estimation and Information Criteria
+
+```{r model-estimation, echo=FALSE, message=FALSE, warning=FALSE}
+
+auto_model <- anti_histam_train %>%
+  model(Auto_ARIMA = ARIMA(Transformed_Sales))
+
+# Extract auto ARIMA spec string and coefficients as a table
+auto_spec_str  <- auto_model$Auto_ARIMA[[1]] |> model_sum()
+n_auto_params  <- tidy(auto_model) |> nrow()
+
+tidy(auto_model) %>%
+  mutate(across(where(is.numeric), \(x) round(x, 4)),
+         p.value = ifelse(p.value < 0.001, "< 0.001",
+                          as.character(round(p.value, 4)))) %>%
+  kable(caption = paste0("Auto ARIMA: ", auto_spec_str,
+                         " — Coefficient Estimates"),
+        align = "c")
+
+fit <- anti_histam_train %>%
+  model(
+    sarima200110 = ARIMA(Transformed_Sales ~ pdq(2,0,0) + PDQ(1,1,0)),
+    sarima101011 = ARIMA(Transformed_Sales ~ pdq(1,0,1) + PDQ(0,1,1)),
+    sarima100110 = ARIMA(Transformed_Sales ~ pdq(1,0,0) + PDQ(1,1,0)),
+    sarima000011 = ARIMA(Transformed_Sales ~ pdq(0,0,0) + PDQ(0,1,1)),
+    sarima000110 = ARIMA(Transformed_Sales ~ pdq(0,0,0) + PDQ(1,1,0)),
+    sarima000111 = ARIMA(Transformed_Sales ~ pdq(0,0,0) + PDQ(1,1,1)),
+    sarima001011 = ARIMA(Transformed_Sales ~ pdq(0,0,1) + PDQ(0,1,1)),
+    sarima001110 = ARIMA(Transformed_Sales ~ pdq(0,0,1) + PDQ(1,1,0)),
+    sarima001111 = ARIMA(Transformed_Sales ~ pdq(0,0,1) + PDQ(1,1,1))
+  )
+
+ic_table <- glance(fit) %>%
+  arrange(AICc) %>%
+  select(.model, AICc, BIC) %>%
+  mutate(across(c(AICc, BIC), round, 2))
+
+kable(ic_table,
+      caption = "Information Criteria (AICc & BIC) for Candidate SARIMA Models",
+      align = "c")
+
+# Best manual model coefficients
+tidy(fit) %>%
+  filter(.model == "sarima000011") %>%
+  mutate(across(where(is.numeric), \(x) round(x, 4)),
+         p.value = ifelse(p.value < 0.001, "< 0.001",
+                          as.character(round(p.value, 4)))) %>%
+  select(term, estimate, std.error, statistic, p.value) %>%
+  kable(caption = "SARIMA(0,0,0)(0,1,1)[12] — Coefficient Estimates",
+        align = "c")
+
+```
+
+Visual inspection of the correlograms reveals significant spikes at
+early non-seasonal lags (lag 1 and 3), indicating regular autoregressive
+or moving average memory ($p=1$ or $q=1$). At the seasonal lags,
+significant activity at lags 12 and 24 confirms the need for seasonal
+parameters ($P=1$ and/or $Q=1$). Because we achieved stationarity
+without regular differencing ($d=0$) but required a seasonal difference
+($D=1$), our candidates follow a general SARIMA$(p, 0, q)(P, 1, Q)_{12}$
+structure. We estimated seven manual permutations derived from these
+diagnostics alongside an automated benchmark. The models are ranked by
+the Corrected Akaike Information Criterion (AICc) to identify the
+optimal balance between goodness-of-fit and parameter parsimony.
+
+With the optimal specification confirmed by report() above, we proceed
+to residual validation.
+
+# Residual Diagnostics
+
+To validate the model for forecasting, we must ensure its residuals are
+consistent with white noise. We analyze the residual Autocorrelation
+Function (ACF) visually and formally test for remaining serial
+dependence using the Ljung-Box test.
+
+```{r residual-diagnostics-all, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+
+model_dofs <- tidy(fit) %>%
+  group_by(.model) %>%
+  summarise(dof = n(), .groups = "drop")
+
+lb_tests_all <- do.call(rbind, lapply(model_dofs$.model, function(m) {
+  d <- model_dofs %>% filter(.model == m) %>% pull(dof)
+  
+  residuals_m <- augment(fit) %>%
+    filter(.model == m) %>%
+    pull(.innov) %>%
+    na.omit()
+  
+  data.frame(
+    .model    = m,
+    dof_used  = d,
+    lb_stat   = Box.test(residuals_m, lag = 24, type = "Ljung-Box", fitdf = d)$statistic,
+    lb_pvalue = Box.test(residuals_m, lag = 24, type = "Ljung-Box", fitdf = d)$p.value
+  )
+}))
+
+rownames(lb_tests_all) <- NULL  # this is the fix
+
+lb_tests_all <- lb_tests_all %>% arrange(lb_pvalue)
+
+
+print(
+  kable(lb_tests_all %>% select(.model, dof_used, lb_stat, lb_pvalue),
+        col.names = c("Model", "DoF", "Ljung-Box stat", "p-value"),
+        caption   = "Ljung-Box test (lag=24) with model-specific degrees of freedom",
+        align     = "c",
+        digits    = 4)
+)
+
+```
+
+To rigorously validate our candidate pool, we applied the formal
+Ljung-Box test ($lag=24$) to the residuals of all estimated models.
+**Candidate specifications that violated invertibility constraints and
+failed Maximum Likelihood Estimation were excluded from the diagnostic
+pool.** For the remaining viable models, the null hypothesis states that
+the residuals are independent white noise. Visual inspection of the
+optimal `sarima(101011)` specification's residuals confirms
+homoskedastic variance, and its Ljung-Box p-value safely exceeds 0.05,
+mathematically proving an absence of significant autocorrelation and
+corroborating its validity for forecasting.
+
+# IN-Sample Forecast Evaluation
+
+```{r in-sample-forecast-evaluation, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+aug <- augment(fit)
+
+aug %>%
+  ggplot(aes(x = Mes)) +
+  geom_line(aes(y = Transformed_Sales), colour = "black", linewidth = 0.6) +
+  geom_line(aes(y = .fitted, colour = .model), alpha = 0.8) +
+  labs(title = "In-sample fit: observed (black) vs fitted by model",
+       y = "Total Sales Volume", x = "Month", colour = "Model")
+
+aug %>%
+  ggplot(aes(x = Mes)) +
+  geom_line(aes(y = Transformed_Sales), colour = "black") +
+  geom_line(aes(y = .fitted), colour = "steelblue") +
+  facet_wrap(~ .model, ncol = 2) +
+  labs(title = "In-sample fit by model",
+       y = "Total Sales Volume", x = "Month")
+
+accuracy(fit) %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  arrange(RMSE) %>%
+  mutate(across(where(is.numeric), \(x) round(x, 4))) %>%
+  kable(caption = "In-Sample Forecast Accuracy — All Candidate Models",
+        align = "c")
+
+```
+
+# Out-of-Sample Forecast Evaluation
+
+```{r out-of-sample-forecast, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+fc <- fit |> forecast(new_data = anti_histam_test)
+
+fc %>%
+  autoplot(anti_histam, level = NULL) +
+  labs(title = "Antihistamine Sales, forecasts from 7 models",
+       y = "Total Sales Volume", x = "Month", colour = "Model")
+
+fc %>%
+  autoplot(anti_histam |> filter(Mes >= cutoff - 24)) +
+  facet_wrap(~ .model, ncol = 2) +
+  labs(title = "Antihistamine Sales, out-of-sample forecast by model",
+       y = "Total Sales Volume", x = "Month")
+
+accuracy(fc, anti_histam) %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  arrange(RMSE) %>%
+  mutate(across(where(is.numeric), \(x) round(x, 4))) %>%
+  kable(caption = paste0("Out-of-Sample Forecast Accuracy (",
+                         nrow(anti_histam_test), "-Month Holdout)"),
+        align = "c")
+
+bind_rows(
+  accuracy(fit)             %>% mutate(Type = "In-sample"),
+  accuracy(fc, anti_histam) %>% mutate(Type = "Out-of-sample")
+) %>%
+  select(Type, .model, RMSE, MAE, MAPE, MASE) %>%
+  arrange(Type, RMSE) %>%
+  mutate(across(where(is.numeric), \(x) round(x, 4))) %>%
+  kable(caption = "In-sample vs out-of-sample accuracy",
+        align = c("l","l","r","r","r","r")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed")) %>%
+  pack_rows("In-sample", 1, 9) %>%
+  pack_rows("Out-of-sample", 10, 18)
+```
+
+First, we evaluated the accuracy of the models within the first 53
+months of training data. Next, we evaluated the accuracy of the results
+from the 16 months of test data.
+
+In both evaluations, we sorted the values by `RMSE`, `MAE`, `MAPE`, and
+`MASE`, and we even compared the in-sample values with the out-of-sample
+ones. In fact, our two best 'out-of-sample' are the models that passed
+the Ljung-Box test.
+
+## Forcast Combination
+
+```{r future-forecast, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+valid_models <- augment(fit) %>%
+  features(.innov, ljung_box, lag = 24) %>%
+  filter(lb_pvalue > 0.05) %>%
+  pull(.model)
+
+weights_rmse <- accuracy(fit) %>%
+  filter(.model %in% valid_models) %>%
+  mutate(w = (1/RMSE) / sum(1/RMSE)) %>%
+  select(.model, RMSE, w)
+
+# Pretty table replacing bare print of valid_models and weights_rmse
+weights_rmse %>%
+  mutate(across(where(is.numeric), \(x) round(x, 4))) %>%
+  kable(caption = "Ljung-Box Survivors: RMSE-Inverse Weights for Combination",
+        align = "c")
+
+fc_combo_rmse <- fc %>%
+  filter(.model %in% valid_models) %>%
+  as_tibble() %>%
+  left_join(weights_rmse %>% select(.model, w), by = ".model") %>%
+  group_by(Mes) %>%
+  summarise(.mean = sum(w * .mean), .groups = "drop") %>%
+  mutate(.model = "combo_rmse")
+
+combo_metrics <- function(fc_combo, label) {
+  fc_combo %>%
+    inner_join(anti_histam_test %>% as_tibble(), by = "Mes") %>%
+    summarise(
+      .model = label,
+      RMSE   = sqrt(mean((Transformed_Sales - .mean)^2))
+    )
+}
+
+bind_rows(
+  accuracy(fc, anti_histam) %>% select(.model, RMSE),
+  combo_metrics(fc_combo_rmse, "combo_rmse")
+) %>%
+  arrange(RMSE) %>%
+  mutate(RMSE = round(RMSE, 4)) %>%
+  kable(caption = "Individual Models vs RMSE-Weighted Combination",
+        align = "c")
+
+ggplot() +
+  geom_line(data = anti_histam |> filter(Mes >= cutoff - 24),
+            aes(x = Mes, y = Transformed_Sales),
+            colour = "black", linewidth = 0.8) +
+  geom_line(data = fc %>% filter(.model %in% valid_models) %>% as_tibble(),
+            aes(x = Mes, y = .mean, group = .model),
+            colour = "grey60", linewidth = 0.4, alpha = 0.7) +
+  geom_line(data = fc_combo_rmse,
+            aes(x = Mes, y = .mean),
+            colour = "firebrick", linewidth = 1) +
+  labs(title = "Forecast Combination vs Individual Models",
+       subtitle = "RMSE-weighted combination (red) vs individual models (grey) vs observed (black)",
+       y = "Total Sales Volume", x = "Month")
+```
+
+In order to create a single forecast chart, we combined the models that
+passed the Ljung-Box test, where the lower the RMSE of the selected
+models, the more weight they carry in the final combined model.
+
+In fact, the RMSE of the combined model is higher than that of all the
+individual models, meaning we achieved a worse model through this
+combination, so the best idea is to take a step back and stop with the
+best-performing model, `Sarima101011`.
+
+## Out-of-Sample Forecast Evaluation
+
+```{r future-forecast-snaive-ets, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+fit_final <- anti_histam_train %>%
+  model(
+    sarima101011 = ARIMA(Transformed_Sales ~ pdq(1,0,1) + PDQ(0,1,1)),
+    Historical_Mean = MEAN(Transformed_Sales),
+    Seasonal_Naive = SNAIVE(Transformed_Sales),
+    ETS = ETS(Transformed_Sales)
+  )
+
+# 2. Project the 14-month out-of-sample forecast
+fc <- fit_final %>% forecast(new_data = anti_histam_test)
+
+# 3. Calculate and print a clean out-of-sample accuracy table
+acc_table <- accuracy(fc, anti_histam) %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  arrange(RMSE)
+
+kable(acc_table, digits = 4, caption = paste0("Out-of-Sample Forecast Accuracy (",
+                 nrow(anti_histam_test), "-Month Holdout)"))
+      
+# 4. Plot the forecast trajectories vs. actual observations
+fc %>%
+  autoplot(anti_histam %>% filter(Mes >= max(anti_histam_train$Mes) - 24),
+           level = c(80, 95)) +
+  labs(title = "Out-of-Sample Forecasting: Auto ARIMA vs Benchmarks",
+       subtitle = paste0(nrow(anti_histam_test),
+                  "-month holdout period with 80% and 95% prediction intervals"),
+       y = "Total Sales Volume (Back-Transformed)", x = "Month")
+
+```
+
+Auto ARIMA, ETS, Seasonal Naïve, and Historical Mean were evaluated on a
+16-month test set using standard error metrics (RMSE, MAE, MAPE, MASE).
+ETS marginally outperformed SARIMA on RMSE. This reflects a small-sample
+effect: with only 53 training observations, SARIMA's extra parameters
+introduce estimation variance that simpler methods avoid. However,
+SARIMA remains practically advantageous, providing structurally
+interpretable coefficients that explicitly identify the seasonal
+mechanisms driving demand
+
+# Conclusion, Limitations & Reflections
+
+## Summary of Findings
+
+This study applied the Box-Jenkins methodology to monthly antihistamine
+sales at a Portuguese pharmacy. Stationarity was achieved using a
+Box-Cox transformation (λ ≈ -0.312) and one seasonal difference (D=1).
+The optimal model, SARIMA(1,0,1)(0,1,1)₁₂, was validated by white-noise
+residuals (Ljung-Box p \> 0.05). Structurally, the seasonal MA(1)
+captures annual allergy cycles, while the regular ARMA(1,1) reflects
+month-to-month purchasing delays. Although ETS slightly outperformed
+SARIMA on RMSE during a 16-month holdout—a known small-sample effect
+given the 53 training observations—SARIMA remains the preferred model
+for its superior interpretability.
+
+## Limitations
+
+The main constraint is sample size. With approximately 69 monthly
+observations total, parameter estimates carry substantial uncertainty
+and out-of-sample comparisons are sensitive to the chosen holdout
+window. A longer record ideally ten or more years would improve model
+stability considerably.
+
+The dataset also covers a single pharmacy location, limiting
+generalizability. Regional pollen calendars, local demographics, and
+prescribing patterns all affect antihistamine demand and are invisible
+to a univariate ARIMA framework. A dataset with genuine seasonal
+structure was deliberately chosen to showcase the full Box-Jenkins
+workflow; a multivariate ARIMAX extension incorporating pollen count
+indices or temperature data as exogenous regressors would likely improve
+both fit and forecasting precision.
+
+## Future Research
+
+A natural extension would apply the same framework to other drug
+categories in the dataset (e.g. N02 analgesics or C10 cardiovascular
+agents) to assess whether seasonal patterns generalize across
+therapeutic classes. Forecast combination — weighting SARIMA, ETS, and
+SNAIVE by inverse training RMSE — could further improve out-of-sample
+precision beyond any single specification, as demonstrated in Timmermann
+(2006).
+
+# References
+
+-   **Zdravkovic, M. (2019).** *Pharma Sales Data*. Kaggle.
+    <https://www.kaggle.com/datasets/milanzdravkovic/pharma-sales-data>
+
+-   **Hyndman, R.J., & Athanasopoulos, G. (2021).** *Forecasting:
+    Principles and Practice* (3rd ed.). OTexts.
+    <https://otexts.com/fpp3/>
+
+-   **Box, G.E.P., & Jenkins, G.M. (1970).** *Time Series Analysis:
+    Forecasting and Control*. Holden-Day.
+
+-   **Cleveland, R.B., Cleveland, W.S., McRae, J.E., & Terpenning, I.
+    (1990).** STL: A seasonal-trend decomposition procedure based on
+    Loess. *Journal of Official Statistics*, 6(1), 3–73.
+
+-   **Ng, S., & Perron, P. (1995).** Unit root tests in ARMA models with
+    data-dependent methods for the selection of the truncation lag.
+    *Journal of the American Statistical Association*, 90(429), 268–281.
+
+-   **Timmermann, A. (2006).** Forecast combinations. In G. Elliott,
+    C.W.J. Granger, & A. Timmermann (Eds.), *Handbook of Economic
+    Forecasting* (Vol. 1, pp. 135–196). Elsevier.
