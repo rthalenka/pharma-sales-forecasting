@@ -15,3 +15,7 @@ An applied time series forecasting analysis predicting monthly retail sales volu
 ## Tech Stack & Libraries
 * **Language:** R
 * **Core Libraries:** `fpp3`, `fable`, `tsibble`, `urca`, `lubridate`, `rmdformats`
+
+
+---
+> **Interactive Report:** To view the formatted report with interactive tables and plots, download [`pharma-sales-forecasting-report.html`](./pharma-sales-forecasting-report.html) and open it in any web browser.
