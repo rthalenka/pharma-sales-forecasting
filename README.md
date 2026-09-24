@@ -12,6 +12,11 @@ An applied time series forecasting analysis predicting monthly retail sales volu
 * `pharma-sales-forecasting-code.Rmd` — Full annotated R Markdown code pipeline.
 * `salesdaily.csv` — Point-of-sale transactional dataset aggregated to monthly frequency.
 
+## Dataset & Provenance
+* **Source:** [Pharma Sales Data on Kaggle](https://www.kaggle.com/datasets/milanzdravkovic/pharma-sales-data) by Milan Zdravković.
+* **Scope:** 6 years of daily transactional Point-of-Sale records aggregated to monthly frequency, focusing on ATC category **R06** (Antihistamines for systemic use).
+  
+
 ## Tech Stack & Libraries
 * **Language:** R
 * **Core Libraries:** `fpp3`, `fable`, `tsibble`, `urca`, `lubridate`, `rmdformats`
