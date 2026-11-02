@@ -74,6 +74,8 @@ pharma-sales-forecasting/
 2. Open the rendered HTML report to explore the visualizations, model comparisons and diagnostic results.
 3. Refer to the original dataset to understand the underlying sales observations.
 
+[**View the interactive forecasting report →**](https://rthalenka.github.io/pharma-sales-forecasting/pharma-sales-forecasting-report.htm)
+
 ## Project Context
 
 Academic project developed as part of the Information Management degree at NOVA IMS.
