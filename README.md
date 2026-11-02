@@ -2,6 +2,9 @@
 
 A time series forecasting project analyzing seasonal demand patterns in pharmaceutical retail sales. Using the Box-Jenkins methodology, SARIMA models and benchmark forecasting techniques, the project explores how historical sales data can support more informed demand planning and inventory management.
 
+
+[**View the interactive forecasting report →**](https://rthalenka.github.io/pharma-sales-forecasting/pharma-sales-forecasting-report.htm)
+
 ## Project Overview
 
 Pharmaceutical demand is influenced by seasonal patterns, particularly for products associated with recurring conditions such as allergies. Understanding these patterns can help retailers anticipate fluctuations in demand and make better inventory planning decisions.
@@ -74,7 +77,6 @@ pharma-sales-forecasting/
 2. Open the rendered HTML report to explore the visualizations, model comparisons and diagnostic results.
 3. Refer to the original dataset to understand the underlying sales observations.
 
-[**View the interactive forecasting report →**](https://rthalenka.github.io/pharma-sales-forecasting/pharma-sales-forecasting-report.htm)
 
 ## Project Context
 
